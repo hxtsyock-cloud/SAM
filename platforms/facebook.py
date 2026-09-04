@@ -19,3 +19,12 @@ def download_by_url(video_url: str) -> Dict:
     if os.path.exists(source_cookies):
         shutil.copy(source_cookies, writable_cookies)
         ydl_opts["cookiefile"] = writable_cookies
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(video_url, download=True)
+        return {
+            "platform": "facebook",
+            "video_id": info.get("id"),
+            "title": info.get("title"),
+            "filepath": ydl.prepare_filename(info),
+        }
