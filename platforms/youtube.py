@@ -7,7 +7,6 @@ def matches_url(video_url: str) -> bool:
     return "youtube.com" in video_url or "youtu.be" in video_url
 
 def download_by_url(video_url: str) -> Dict:
-    # نسخ ملف الكوكيز من المجلد المحمي (read-only) إلى مجلد مؤقت قابل للكتابة
     source_cookies = "/etc/secrets/youtube_cookies.txt"
     writable_cookies = "/tmp/youtube_cookies.txt"
 
@@ -20,7 +19,7 @@ def download_by_url(video_url: str) -> Dict:
         "cookiefile": writable_cookies,
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "web"],
+                "player_client": ["tv", "web"],
             }
         },
     }
@@ -35,7 +34,6 @@ def download_by_url(video_url: str) -> Dict:
         }
 
 def download_by_username(username: str) -> Dict:
-    # يدعم قنوات يوتيوب
     url = f"https://www.youtube.com/@{username}"
     return download_by_url(url)
 
