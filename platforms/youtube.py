@@ -15,7 +15,7 @@ def download_by_url(video_url: str) -> Dict:
         shutil.copy(source_cookies, writable_cookies)
 
     ydl_opts = {
-        "format": "bestvideo+bestaudio/best",
+        "format": "best[ext=mp4]/bestvideo+bestaudio/best",
         "outtmpl": "%(id)s.%(ext)s",
         "cookiefile": writable_cookies,
     }
