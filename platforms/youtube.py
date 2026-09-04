@@ -18,6 +18,11 @@ def download_by_url(video_url: str) -> Dict:
         "format": "best[ext=mp4]/bestvideo+bestaudio/best",
         "outtmpl": "%(id)s.%(ext)s",
         "cookiefile": writable_cookies,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"],
+            }
+        },
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
