@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-yt-dlp
+yt-dlp @ git+https://github.com/yt-dlp/yt-dlp.git
 requests
 python-multipart
 curl_cffi
