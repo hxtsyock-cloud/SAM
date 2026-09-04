@@ -5,13 +5,11 @@ def matches_url(video_url: str) -> bool:
     return "youtube.com" in video_url or "youtu.be" in video_url
 
 def download_by_url(video_url: str) -> Dict:
-    ydl_opts = {
+      ydl_opts = {
         "format": "bestvideo+bestaudio/best",
         "outtmpl": "%(id)s.%(ext)s",
+        "cookiefile": "/etc/secrets/youtube_cookies.txt",
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(video_url, download=True)
-        return {
             "platform": "youtube",
             "video_id": info.get("id"),
             "title": info.get("title"),
