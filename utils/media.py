@@ -1,3 +1,4 @@
+import base64
 import os
 import shutil
 from typing import Any, Dict, List, Optional
@@ -73,11 +74,41 @@ def _copy_cookie(source: str, destination: str) -> Optional[str]:
     return destination
 
 
+def _cookiefile(
+    env_name: str,
+    source: str,
+    destination: str,
+) -> Optional[str]:
+    configured_path = os.getenv(f"{env_name}_PATH")
+    if configured_path and os.path.exists(configured_path):
+        shutil.copy(configured_path, destination)
+        return destination
+
+    encoded = os.getenv(f"{env_name}_B64")
+    if encoded:
+        try:
+            cookie_bytes = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError(f"{env_name}_B64 is not valid base64") from exc
+        with open(destination, "wb") as cookie_file:
+            cookie_file.write(cookie_bytes)
+        return destination
+
+    cookie_text = os.getenv(env_name)
+    if cookie_text:
+        with open(destination, "w", encoding="utf-8", newline="") as cookie_file:
+            cookie_file.write(cookie_text)
+        return destination
+
+    return _copy_cookie(source, destination)
+
+
 def _platform_options(platform: str) -> Dict[str, Any]:
     options: Dict[str, Any] = {}
 
     if platform == "facebook":
-        cookiefile = _copy_cookie(
+        cookiefile = _cookiefile(
+            "FACEBOOK_COOKIES",
             "/etc/secrets/facebook_cookies.txt",
             "/tmp/facebook_cookies.txt",
         )
@@ -85,7 +116,8 @@ def _platform_options(platform: str) -> Dict[str, Any]:
             options["cookiefile"] = cookiefile
 
     if platform == "youtube":
-        cookiefile = _copy_cookie(
+        cookiefile = _cookiefile(
+            "YOUTUBE_COOKIES",
             "/etc/secrets/youtube_cookies.txt",
             "/tmp/youtube_cookies.txt",
         )
@@ -94,6 +126,9 @@ def _platform_options(platform: str) -> Dict[str, Any]:
         options["extractor_args"] = {
             "youtube": {"player_client": ["tv", "web"]}
         }
+        if shutil.which("deno"):
+            options["js_runtimes"] = {"deno": {}}
+        options["remote_components"] = ["ejs:github"]
 
     if platform == "tiktok":
         options.update(
