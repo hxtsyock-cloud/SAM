@@ -452,8 +452,14 @@ def download_media(
         no_watermark=no_watermark,
     )
     with yt_dlp.YoutubeDL(download_options) as ydl:
-        ydl.download([source_url])
-        filename = ydl.prepare_filename(info)
+        # نستخدم extract_info(download=True) بدل download() + info القديمة،
+        # عشان نضمن إن اسم الملف محسوب من نفس عملية التحميل الفعلية
+        # (بعض الروابط، زي مشاركات سناب شات، تحتوي رموز جلسة تتغيّر
+        # بين كل زيارة، فلو استخدمنا معلومات من زيارة فحص سابقة،
+        # يصير تعارض بين الاسم المتوقع والاسم الفعلي المحفوظ)
+        download_info = ydl.extract_info(source_url, download=True)
+        filename = ydl.prepare_filename(download_info)
+        info = download_info
 
     filepath = _final_filepath(
         filename,
