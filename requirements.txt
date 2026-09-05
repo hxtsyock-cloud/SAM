@@ -4,3 +4,4 @@ yt-dlp[default] @ git+https://github.com/yt-dlp/yt-dlp.git
 requests
 python-multipart
 curl_cffi
+imageio-ffmpeg
