@@ -1,18 +1,23 @@
-import yt_dlp
-import shutil
 import os
+import shutil
 from typing import Dict
+
+import yt_dlp
+
+from utils.quality import format_selector
+
 
 def matches_url(video_url: str) -> bool:
     return "facebook.com" in video_url or "fb.watch" in video_url
 
-def download_by_url(video_url: str) -> Dict:
+
+def download_by_url(video_url: str, quality: str = "best") -> Dict:
     # نسخ ملف الكوكيز من المجلد المحمي (read-only) إلى مجلد مؤقت قابل للكتابة
     source_cookies = "/etc/secrets/facebook_cookies.txt"
     writable_cookies = "/tmp/facebook_cookies.txt"
 
     ydl_opts = {
-        "format": "best",
+        "format": format_selector(quality, "facebook"),
         "outtmpl": "%(id)s.%(ext)s",
     }
 
@@ -26,5 +31,6 @@ def download_by_url(video_url: str) -> Dict:
             "platform": "facebook",
             "video_id": info.get("id"),
             "title": info.get("title"),
+            "quality": quality,
             "filepath": ydl.prepare_filename(info),
         }
