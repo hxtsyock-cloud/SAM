@@ -62,7 +62,7 @@ def format_selector(quality: Optional[str], platform: str) -> str:
     height = QUALITY_HEIGHTS[selected_quality]
     return (
         f"bestvideo[height<={height}]+bestaudio/"
-        f"best[height<={height}]/best"
+        f"best[height<={height}]"
     )
 
 
