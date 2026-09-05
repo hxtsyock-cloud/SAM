@@ -203,7 +203,7 @@ def build_ydl_options(
 
     options: Dict[str, Any] = {
         "format": media_format,
-        "outtmpl": "%(id)s.%(ext)s",
+        "outtmpl": "%(id).150s.%(ext)s",
         "noplaylist": noplaylist,
         "quiet": True,
     }
