@@ -165,6 +165,7 @@ def build_ydl_options(
     noplaylist: bool = True,
     extract_flat: bool = False,
     no_watermark: bool = False,
+    ensure_mp4: bool = True,
 ) -> Dict[str, Any]:
     selected_quality = normalize_quality(quality, platform)
     selected_mode = normalize_mode(mode)
@@ -174,7 +175,11 @@ def build_ydl_options(
     if compress and selected_mode in ("audio", "gif"):
         raise ValueError("Compression is available for video modes only")
 
-    requires_ffmpeg = selected_mode in ("audio", "gif") or compress
+    requires_ffmpeg = (
+        selected_mode in ("audio", "gif")
+        or compress
+        or (ensure_mp4 and selected_mode in ("video", "video_no_audio"))
+    )
     ffmpeg_location = _ffmpeg_location(required=requires_ffmpeg)
     include_audio = selected_mode == "video"
 
@@ -230,6 +235,13 @@ def build_ydl_options(
                 "+faststart",
             ]
         }
+    elif ensure_mp4 and selected_mode in ("video", "video_no_audio"):
+        # Remuxing copies the encoded streams and therefore preserves their
+        # quality.  It deliberately fails when the source codecs cannot be
+        # placed in an MP4 container instead of silently transcoding them.
+        options["postprocessors"] = [
+            {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}
+        ]
 
     return options
 
@@ -337,6 +349,7 @@ def inspect_media(
         mode="video",
         noplaylist=False,
         extract_flat=True,
+        ensure_mp4=False,
     )
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(source_url, download=False)
@@ -368,7 +381,7 @@ def _final_filepath(
         return f"{root}.{audio_format}"
     if mode == "gif":
         return f"{root}.gif"
-    if compress:
+    if mode in ("video", "video_no_audio") or compress:
         return f"{root}.mp4"
     return filename
 
@@ -433,6 +446,19 @@ def download_media(
         ydl.download([source_url])
         filename = ydl.prepare_filename(info)
 
+    filepath = _final_filepath(
+        filename,
+        selected_mode,
+        selected_audio_format,
+        compress,
+    )
+    if selected_mode in ("video", "video_no_audio") and not filepath.lower().endswith(
+        ".mp4"
+    ):
+        raise RuntimeError("The downloaded video was not produced as an MP4 file")
+    if not os.path.isfile(filepath):
+        raise RuntimeError(f"Download completed but output file is missing: {filepath}")
+
     return {
         "platform": platform,
         "video_id": info.get("id"),
@@ -442,12 +468,8 @@ def download_media(
         "mode": selected_mode,
         "audio_format": selected_audio_format if selected_mode == "audio" else None,
         "compressed": bool(compress),
-        "filepath": _final_filepath(
-            filename,
-            selected_mode,
-            selected_audio_format,
-            compress,
-        ),
+        "container": "mp4" if selected_mode in ("video", "video_no_audio") else None,
+        "filepath": filepath,
     }
 
 
