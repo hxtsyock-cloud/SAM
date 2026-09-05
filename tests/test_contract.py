@@ -8,6 +8,7 @@ from utils.media import (
     normalize_compression_crf,
     normalize_limit,
     normalize_mode,
+    _watermark_is_proven_absent,
 )
 from utils.quality import format_selector, normalize_quality
 
@@ -59,6 +60,11 @@ class MediaContractTests(unittest.TestCase):
                 )
                 self.assertTrue(options["noplaylist"])
                 self.assertIn("format", options)
+
+    def test_watermark_mode_fails_closed(self):
+        self.assertTrue(_watermark_is_proven_absent({"watermark_free": True}))
+        self.assertTrue(_watermark_is_proven_absent({"has_watermark": False}))
+        self.assertFalse(_watermark_is_proven_absent({}))
 
 
 if __name__ == "__main__":
