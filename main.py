@@ -1,9 +1,11 @@
 import os
+import json
+from urllib.parse import unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from yt_dlp.utils import DownloadError
 
@@ -46,6 +48,30 @@ class SelectedDownloadRequest(BaseModel):
     compression_crf: int = 28
     no_watermark: bool = False
     max_concurrency: int = 4
+
+
+def _normalize_download_filename(filename: str) -> str:
+    """Accept a filepath or a serialized API result without exposing paths."""
+    candidate = filename
+    for _ in range(2):
+        candidate = unquote(candidate)
+
+    try:
+        payload = json.loads(candidate)
+    except (TypeError, ValueError):
+        payload = None
+
+    if isinstance(payload, dict):
+        candidate = payload.get("filepath") or payload.get("filename") or ""
+    elif isinstance(payload, str):
+        candidate = payload
+
+    for _ in range(2):
+        candidate = unquote(str(candidate))
+    candidate = os.path.basename(candidate)
+    if not candidate or candidate in {".", ".."}:
+        raise HTTPException(status_code=400, detail="A valid filename is required")
+    return candidate
 
 
 def _canonical_platform(platform: str) -> str:
@@ -103,6 +129,8 @@ def _media_error(exc: Exception) -> None:
             phrase in lowered
             for phrase in (
                 "sign in",
+                "log in",
+                "login",
                 "not a bot",
                 "cookies",
                 "authentication",
@@ -111,9 +139,10 @@ def _media_error(exc: Exception) -> None:
         )
         if requires_auth:
             message = (
-                "The platform requires authentication cookies. Configure "
-                "YOUTUBE_COOKIES_B64 (Netscape cookies file, base64 encoded) "
-                "or the matching platform cookie secret, then retry."
+                "The platform requires authentication cookies. Configure the "
+                "matching platform cookie secret, for example "
+                "INSTAGRAM_COOKIES_B64 or YOUTUBE_COOKIES_B64 using a Netscape "
+                "cookies file, then retry."
             )
         raise HTTPException(
             status_code=502,
@@ -290,6 +319,22 @@ def _download_many(
 @app.get("/platforms")
 async def get_platforms():
     return _capabilities()
+
+
+@app.get("/")
+async def health():
+    return {
+        "service": app.title,
+        "status": "ok",
+        "health": "/",
+        "documentation": "/docs",
+        "capabilities": "/capabilities",
+    }
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    return Response(status_code=204)
 
 
 @app.get("/capabilities")
@@ -487,7 +532,7 @@ async def download_by_ids(
 
 @app.get("/download/file")
 async def download_file(filename: str):
-    safe_filename = os.path.basename(filename)
+    safe_filename = _normalize_download_filename(filename)
     file_path = os.path.join(os.getcwd(), safe_filename)
 
     if not os.path.isfile(file_path):
