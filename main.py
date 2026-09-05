@@ -1,4 +1,5 @@
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
@@ -16,6 +17,7 @@ from utils.media import (
     inspect_media,
     normalize_audio_format,
     normalize_compression_crf,
+    normalize_limit,
     normalize_mode,
     profile_url,
 )
@@ -42,6 +44,8 @@ class SelectedDownloadRequest(BaseModel):
     audio_format: str = "m4a"
     compress: bool = False
     compression_crf: int = 28
+    no_watermark: bool = False
+    max_concurrency: int = 4
 
 
 def _canonical_platform(platform: str) -> str:
@@ -74,6 +78,7 @@ def _options(
     audio_format: str,
     compress: bool,
     compression_crf: int,
+    no_watermark: bool = False,
 ) -> Dict[str, Any]:
     try:
         return {
@@ -82,6 +87,7 @@ def _options(
             "audio_format": normalize_audio_format(audio_format),
             "compress": bool(compress),
             "compression_crf": normalize_compression_crf(compression_crf),
+            "no_watermark": bool(no_watermark),
         }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -136,16 +142,30 @@ def _capabilities() -> Dict[str, Any]:
             "video_compression": True,
             "download_all_profile_videos": True,
             "watermark_removal": False,
-            "watermark_policy": "original-source-only when exposed by the platform",
+            "watermark_free_strict_mode": True,
+            "watermark_policy": (
+                "no_watermark=true returns only an explicitly verified "
+                "watermark-free source; otherwise it fails safely"
+            ),
+            "parallel_batch_download": True,
         },
         "frontend_inputs": ["video_or_story_url", "username"],
     }
 
 
-def _inspect_source(source_url: str, limit: int = 100) -> Dict[str, Any]:
+def _inspect_source(
+    source_url: str,
+    limit: int = 100,
+    source_kind: str = "video",
+) -> Dict[str, Any]:
     platform = _platform_or_error(source_url)
     try:
-        return inspect_media(source_url, platform, limit=max(0, min(limit, 1000)))
+        return inspect_media(
+            source_url,
+            platform,
+            limit=normalize_limit(limit),
+            source_kind=source_kind,
+        )
     except (ValueError, RuntimeError, DownloadError) as exc:
         _media_error(exc)
     raise AssertionError("unreachable")
@@ -159,6 +179,7 @@ def _download_one(
     audio_format: str,
     compress: bool,
     compression_crf: int,
+    no_watermark: bool = False,
 ) -> Dict[str, Any]:
     rate_limit(request)
     platform = _platform_or_error(source_url)
@@ -169,6 +190,7 @@ def _download_one(
         audio_format,
         compress,
         compression_crf,
+        no_watermark,
     )
     cache_key = "|".join(
         [
@@ -178,6 +200,7 @@ def _download_one(
             options["audio_format"],
             str(options["compress"]),
             str(options["compression_crf"]),
+            str(options["no_watermark"]),
         ]
     )
     if options["mode"] == "video" and not options["compress"]:
@@ -211,27 +234,51 @@ def _download_many(
     audio_format: str,
     compress: bool,
     compression_crf: int,
+    no_watermark: bool = False,
+    max_concurrency: int = 4,
 ) -> Dict[str, Any]:
     if not video_urls:
         raise HTTPException(status_code=400, detail="video_urls cannot be empty")
 
-    videos = []
-    errors = []
-    for source_url in video_urls:
-        try:
-            videos.append(
-                _download_one(
-                    request,
-                    source_url,
-                    quality,
-                    mode,
-                    audio_format,
-                    compress,
-                    compression_crf,
-                )
-            )
-        except HTTPException as exc:
-            errors.append({"url": source_url, "error": exc.detail})
+    try:
+        workers = max(1, min(int(max_concurrency), 8))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="max_concurrency must be an integer from 1 to 8",
+        ) from exc
+
+    videos_by_index: Dict[int, Dict[str, Any]] = {}
+    errors_by_index: Dict[int, Dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                _download_one,
+                request,
+                source_url,
+                quality,
+                mode,
+                audio_format,
+                compress,
+                compression_crf,
+                no_watermark,
+            ): (index, source_url)
+            for index, source_url in enumerate(video_urls)
+        }
+        for future in as_completed(futures):
+            index, source_url = futures[future]
+            try:
+                videos_by_index[index] = future.result()
+            except HTTPException as exc:
+                errors_by_index[index] = {"url": source_url, "error": exc.detail}
+            except Exception as exc:
+                errors_by_index[index] = {
+                    "url": source_url,
+                    "error": {"code": "unexpected_download_error", "message": str(exc)},
+                }
+
+    videos = [videos_by_index[index] for index in sorted(videos_by_index)]
+    errors = [errors_by_index[index] for index in sorted(errors_by_index)]
     return {
         "requested": len(video_urls),
         "downloaded": len(videos),
@@ -257,12 +304,12 @@ async def inspect_by_url(video_url: str, limit: int = 100):
 
 @app.get("/inspect/playlist")
 async def inspect_playlist(playlist_url: str, limit: int = 100):
-    return _inspect_source(playlist_url, limit)
+    return _inspect_source(playlist_url, limit, source_kind="playlist")
 
 
 @app.get("/inspect/story")
 async def inspect_story(story_url: str, limit: int = 100):
-    return _inspect_source(story_url, limit)
+    return _inspect_source(story_url, limit, source_kind="story")
 
 
 @app.post("/inspect/by-username")
@@ -278,7 +325,13 @@ async def inspect_by_username(
         raise HTTPException(status_code=400, detail="Unsupported platform")
     try:
         source_url = profile_url(platform, username)
-        result = inspect_media(source_url, platform, limit=max(0, min(limit, 1000)))
+        result = inspect_media(
+            source_url,
+            platform,
+            limit=normalize_limit(limit),
+            source_kind="profile",
+            maximum=1000,
+        )
         result["profile_url"] = source_url
         result["username"] = username.lstrip("@")
         return result
@@ -295,6 +348,7 @@ async def download_by_url(
     audio_format: str = "m4a",
     compress: bool = False,
     compression_crf: int = 28,
+    no_watermark: bool = False,
 ):
     return _download_one(
         request,
@@ -304,6 +358,7 @@ async def download_by_url(
         audio_format,
         compress,
         compression_crf,
+        no_watermark,
     )
 
 
@@ -316,6 +371,7 @@ async def download_finished_live(
     audio_format: str = "m4a",
     compress: bool = False,
     compression_crf: int = 28,
+    no_watermark: bool = False,
 ):
     return _download_one(
         request,
@@ -325,6 +381,7 @@ async def download_finished_live(
         audio_format,
         compress,
         compression_crf,
+        no_watermark,
     )
 
 
@@ -338,6 +395,8 @@ async def download_selected(request: Request, payload: SelectedDownloadRequest):
         payload.audio_format,
         payload.compress,
         payload.compression_crf,
+        payload.no_watermark,
+        payload.max_concurrency,
     )
 
 
@@ -353,6 +412,8 @@ async def download_by_username(
     compression_crf: int = 28,
     download_all: bool = False,
     limit: int = 1000,
+    no_watermark: bool = False,
+    max_concurrency: int = 4,
 ):
     rate_limit(request)
     canonical = _canonical_platform(platform.lower())
@@ -361,7 +422,13 @@ async def download_by_username(
 
     try:
         source_url = profile_url(canonical, username)
-        profile = inspect_media(source_url, canonical, limit=max(0, min(limit, 10000)))
+        profile = inspect_media(
+            source_url,
+            canonical,
+            limit=normalize_limit(limit, maximum=10000),
+            source_kind="profile",
+            maximum=10000,
+        )
         profile["profile_url"] = source_url
         profile["username"] = username.lstrip("@")
     except (ValueError, RuntimeError, DownloadError) as exc:
@@ -380,6 +447,8 @@ async def download_by_username(
         audio_format,
         compress,
         compression_crf,
+        no_watermark,
+        max_concurrency,
     )
 
 
@@ -393,6 +462,8 @@ async def download_by_ids(
     audio_format: str = "m4a",
     compress: bool = False,
     compression_crf: int = 28,
+    no_watermark: bool = False,
+    max_concurrency: int = 4,
 ):
     canonical = _canonical_platform(platform.lower())
     if canonical not in PLATFORMS:
@@ -409,6 +480,8 @@ async def download_by_ids(
         audio_format,
         compress,
         compression_crf,
+        no_watermark,
+        max_concurrency,
     )
 
 
