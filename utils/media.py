@@ -11,6 +11,7 @@ from utils.quality import format_selector, normalize_quality
 
 AUDIO_FORMATS = ("mp3", "aac", "m4a", "wav")
 MEDIA_MODES = ("video", "audio", "video_no_audio", "gif")
+MAX_PROFILE_LIMIT = 1000
 MODE_ALIASES = {
     "audio_only": "audio",
     "audio-only": "audio",
@@ -22,6 +23,17 @@ MODE_ALIASES = {
     "mute": "video_no_audio",
     "animated_gif": "gif",
 }
+
+
+def normalize_limit(limit: int, maximum: int = MAX_PROFILE_LIMIT) -> int:
+    """Validate collection limits instead of treating negative values as unlimited."""
+    try:
+        value = int(limit)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("limit must be a positive integer") from exc
+    if value < 1:
+        raise ValueError("limit must be at least 1")
+    return min(value, maximum)
 
 
 def normalize_mode(mode: Optional[str]) -> str:
@@ -152,6 +164,7 @@ def build_ydl_options(
     compression_crf: int = 28,
     noplaylist: bool = True,
     extract_flat: bool = False,
+    no_watermark: bool = False,
 ) -> Dict[str, Any]:
     selected_quality = normalize_quality(quality, platform)
     selected_mode = normalize_mode(mode)
@@ -208,7 +221,13 @@ def build_ydl_options(
                 "-crf",
                 str(selected_crf),
                 "-preset",
-                "medium",
+                "slow",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-movflags",
+                "+faststart",
             ]
         }
 
@@ -235,11 +254,19 @@ def _entry_summary(entry: Dict[str, Any]) -> Dict[str, Any]:
         "uploader_id",
         "channel",
         "channel_id",
+        "repost_count",
+        "is_repost",
     )
     return {key: entry.get(key) for key in fields if entry.get(key) is not None}
 
 
-def serialize_info(info: Dict[str, Any], source_url: str, limit: int = 100) -> Dict[str, Any]:
+def serialize_info(
+    info: Dict[str, Any],
+    source_url: str,
+    limit: int = 100,
+    maximum: int = MAX_PROFILE_LIMIT,
+) -> Dict[str, Any]:
+    limit = normalize_limit(limit, maximum=maximum)
     raw_entries = info.get("entries") or []
     entries = list(raw_entries)
     total = len(entries)
@@ -277,6 +304,22 @@ def serialize_info(info: Dict[str, Any], source_url: str, limit: int = 100) -> D
         "entry_count": total,
         "has_more": limit > 0 and total > len(entries),
         "entries": [_entry_summary(entry) for entry in entries if entry],
+        "videos": [_entry_summary(entry) for entry in entries if entry],
+        "profile": {
+            "username": info.get("uploader") or info.get("uploader_id"),
+            "display_name": info.get("uploader") or info.get("channel"),
+            "avatar_url": (
+                info.get("uploader_avatar")
+                or info.get("channel_thumbnail")
+                or info.get("thumbnail")
+            ),
+            "bio": info.get("uploader_description") or info.get("description"),
+            "url": info.get("uploader_url") or info.get("channel_url"),
+        },
+        "reposts": info.get("reposts") or info.get("reposted_entries") or [],
+        "reposts_available": bool(
+            info.get("reposts") or info.get("reposted_entries")
+        ),
     }
     result.update({key: info.get(key) for key in fields if info.get(key) is not None})
     return result
@@ -286,6 +329,8 @@ def inspect_media(
     source_url: str,
     platform: str,
     limit: int = 100,
+    source_kind: str = "video",
+    maximum: int = MAX_PROFILE_LIMIT,
 ) -> Dict[str, Any]:
     options = build_ydl_options(
         platform,
@@ -295,7 +340,21 @@ def inspect_media(
     )
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(source_url, download=False)
-    return serialize_info(info, source_url, limit=limit)
+    result = serialize_info(info, source_url, limit=limit, maximum=maximum)
+    result["source_kind"] = source_kind
+    return result
+
+
+def _watermark_is_proven_absent(info: Dict[str, Any]) -> bool:
+    """Only accept an explicit extractor guarantee for no-watermark mode."""
+    if info.get("watermark_free") is True or info.get("is_watermark_free") is True:
+        return True
+    if info.get("has_watermark") is False or info.get("watermark") is False:
+        return True
+    for fmt in info.get("formats") or []:
+        if fmt.get("watermark_free") is True or fmt.get("is_watermark_free") is True:
+            return True
+    return False
 
 
 def _final_filepath(
@@ -322,6 +381,7 @@ def download_media(
     audio_format: str = "m4a",
     compress: bool = False,
     compression_crf: int = 28,
+    no_watermark: bool = False,
 ) -> Dict[str, Any]:
     selected_mode = normalize_mode(mode)
     selected_audio_format = normalize_audio_format(audio_format)
@@ -336,6 +396,7 @@ def download_media(
         compress=compress,
         compression_crf=selected_crf,
         noplaylist=False,
+        no_watermark=no_watermark,
     )
     with yt_dlp.YoutubeDL(probe_options) as ydl:
         info = ydl.extract_info(source_url, download=False)
@@ -346,8 +407,17 @@ def download_media(
             "Selection required: inspect the source first and send selected video URLs"
         )
 
-    if info.get("is_live") or info.get("live_status") == "is_live":
+    live_status = info.get("live_status")
+    if live_status == "is_live" or (
+        info.get("is_live") is True
+        and live_status not in {"was_live", "post_live", "not_live"}
+    ):
         raise ValueError("The live stream is still in progress")
+    if no_watermark and not _watermark_is_proven_absent(info):
+        raise RuntimeError(
+            "No watermark-free source was verified; refusing to return a "
+            "possibly watermarked file"
+        )
 
     download_options = build_ydl_options(
         platform,
@@ -357,6 +427,7 @@ def download_media(
         compress=compress,
         compression_crf=selected_crf,
         noplaylist=True,
+        no_watermark=no_watermark,
     )
     with yt_dlp.YoutubeDL(download_options) as ydl:
         ydl.download([source_url])
