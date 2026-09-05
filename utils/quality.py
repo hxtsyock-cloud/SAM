@@ -54,16 +54,22 @@ def normalize_quality(quality: Optional[str], platform: str) -> str:
     return value
 
 
-def format_selector(quality: Optional[str], platform: str) -> str:
+def format_selector(
+    quality: Optional[str],
+    platform: str,
+    include_audio: bool = True,
+) -> str:
     selected_quality = normalize_quality(quality, platform)
     if selected_quality == "best":
-        return "bestvideo+bestaudio/best"
+        return "bestvideo+bestaudio/best" if include_audio else "bestvideo/best"
 
     height = QUALITY_HEIGHTS[selected_quality]
-    return (
-        f"bestvideo[height<={height}]+bestaudio/"
-        f"best[height<={height}]"
-    )
+    if include_audio:
+        return (
+            f"bestvideo[height<={height}]+bestaudio/"
+            f"best[height<={height}]"
+        )
+    return f"bestvideo[height<={height}]/best[height<={height}]"
 
 
 def quality_options(platform: str) -> List[str]:
