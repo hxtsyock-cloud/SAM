@@ -142,6 +142,15 @@ def _platform_options(platform: str) -> Dict[str, Any]:
             options["js_runtimes"] = {"deno": {}}
         options["remote_components"] = ["ejs:github"]
 
+    if platform == "instagram":
+        cookiefile = _cookiefile(
+            "INSTAGRAM_COOKIES",
+            "/etc/secrets/instagram_cookies.txt",
+            "/tmp/instagram_cookies.txt",
+        )
+        if cookiefile:
+            options["cookiefile"] = cookiefile
+
     if platform == "tiktok":
         options.update(
             {
