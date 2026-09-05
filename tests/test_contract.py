@@ -4,6 +4,7 @@ from utils.media import (
     AUDIO_FORMATS,
     MEDIA_MODES,
     build_ydl_options,
+    _final_filepath,
     normalize_audio_format,
     normalize_compression_crf,
     normalize_limit,
@@ -60,6 +61,21 @@ class MediaContractTests(unittest.TestCase):
                 )
                 self.assertTrue(options["noplaylist"])
                 self.assertIn("format", options)
+                if mode in ("video", "video_no_audio"):
+                    self.assertEqual(
+                        options["postprocessors"][0]["key"],
+                        "FFmpegVideoRemuxer",
+                    )
+
+    def test_video_outputs_are_mp4(self):
+        self.assertEqual(
+            _final_filepath("abc.webm", "video", "m4a", False),
+            "abc.mp4",
+        )
+        self.assertEqual(
+            _final_filepath("abc.mkv", "video_no_audio", "m4a", False),
+            "abc.mp4",
+        )
 
     def test_watermark_mode_fails_closed(self):
         self.assertTrue(_watermark_is_proven_absent({"watermark_free": True}))
