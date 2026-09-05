@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from yt_dlp.utils import DownloadError
 
 from platforms import facebook, instagram, snapchat, tiktok, twitter, youtube
 from utils.cache import cache_get, cache_set
@@ -87,9 +88,31 @@ def _options(
 
 
 def _media_error(exc: Exception) -> None:
-    message = str(exc)
+    message = str(exc).strip()
+    lowered = message.lower()
     if message.startswith("Selection required"):
         raise HTTPException(status_code=409, detail=message) from exc
+    if isinstance(exc, DownloadError):
+        requires_auth = any(
+            phrase in lowered
+            for phrase in (
+                "sign in",
+                "not a bot",
+                "cookies",
+                "authentication",
+                "confirm you're not a bot",
+            )
+        )
+        if requires_auth:
+            message = (
+                "The platform requires authentication cookies. Configure "
+                "YOUTUBE_COOKIES_B64 (Netscape cookies file, base64 encoded) "
+                "or the matching platform cookie secret, then retry."
+            )
+        raise HTTPException(
+            status_code=502,
+            detail={"code": "upstream_extractor_error", "message": message[:500]},
+        ) from exc
     if isinstance(exc, RuntimeError):
         raise HTTPException(status_code=503, detail=message) from exc
     raise HTTPException(status_code=400, detail=message) from exc
@@ -123,7 +146,7 @@ def _inspect_source(source_url: str, limit: int = 100) -> Dict[str, Any]:
     platform = _platform_or_error(source_url)
     try:
         return inspect_media(source_url, platform, limit=max(0, min(limit, 1000)))
-    except (ValueError, RuntimeError) as exc:
+    except (ValueError, RuntimeError, DownloadError) as exc:
         _media_error(exc)
     raise AssertionError("unreachable")
 
@@ -164,7 +187,7 @@ def _download_one(
 
     try:
         result = download_media(source_url, platform, **options)
-    except (ValueError, RuntimeError) as exc:
+    except (ValueError, RuntimeError, DownloadError) as exc:
         _media_error(exc)
     if options["mode"] == "video" and not options["compress"]:
         cache_set(cache_key, result)
@@ -259,7 +282,7 @@ async def inspect_by_username(
         result["profile_url"] = source_url
         result["username"] = username.lstrip("@")
         return result
-    except (ValueError, RuntimeError) as exc:
+    except (ValueError, RuntimeError, DownloadError) as exc:
         _media_error(exc)
 
 
@@ -341,7 +364,7 @@ async def download_by_username(
         profile = inspect_media(source_url, canonical, limit=max(0, min(limit, 10000)))
         profile["profile_url"] = source_url
         profile["username"] = username.lstrip("@")
-    except (ValueError, RuntimeError) as exc:
+    except (ValueError, RuntimeError, DownloadError) as exc:
         _media_error(exc)
 
     if not download_all:
