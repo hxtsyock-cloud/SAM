@@ -6,3 +6,4 @@ python-multipart
 curl_cffi
 imageio-ffmpeg
 yt-dlp-ejs
+imageio-ffmpeg
