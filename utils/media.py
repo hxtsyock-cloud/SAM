@@ -610,3 +610,56 @@ def debug_youtube_probe(video_url: str) -> Dict[str, Any]:
         if "pot" in line.lower() or "po token" in line.lower()
     ]
     return result
+
+
+# === تعديل جديد: دالة تشخيص تستخرج الرابط المباشر بدون تحميل الملف على السيرفر ===
+def debug_youtube_direct_link(video_url: str) -> Dict[str, Any]:
+    """
+    تستخرج بيانات فيديو يوتيوب (extract_info مع download=False) وترجّع
+    الرابط المباشر (direct URL) من سيرفرات يوتيوب (googlevideo.com) بدون
+    ما تحمّل أي بايت على قرص السيرفر. الهدف: اختبار هل هذا الرابط يشتغل
+    من IP مختلف (جهازك الشخصي) أو لا — قبل ما نغيّر بنية /download/by-url
+    بالكامل ليوتيوب.
+
+    تشخيصي فقط، ما يغيّر أي سلوك تشغيلي حقيقي بباقي المشروع.
+    """
+    options = build_ydl_options(
+        "youtube",
+        mode="video",
+        noplaylist=True,
+        ensure_mp4=False,
+    )
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(video_url, download=False)
+
+    # لو الصيغة المختارة مدمجة (فيديو+صوت بملف واحد، زي HLS)، الرابط موجود
+    # مباشرة بـ info["url"]. لو الصيغة منفصلة (فيديو + صوت كل واحد لحاله)،
+    # الروابط موجودة بـ info["requested_formats"] بدلها.
+    requested_formats = info.get("requested_formats") or []
+    direct_url = info.get("url")
+    if not direct_url and requested_formats:
+        direct_url = requested_formats[0].get("url")
+
+    return {
+        "video_id": info.get("id"),
+        "title": info.get("title"),
+        "format_id": info.get("format_id"),
+        "direct_url": direct_url,
+        "note": (
+            "افتح direct_url من متصفح جهازك الشخصي (مو من سيرفر Render) "
+            "وشوف هل الفيديو/الصوت يشتغل أو يرجع خطأ 403. لو requested_formats "
+            "فيها أكثر من عنصر، معناها الفيديو والصوت منفصلين وكل واحد له "
+            "رابط مستقل — رابط requested_formats[0] غالبًا الفيديو."
+        ),
+        "requested_formats": [
+            {
+                "format_id": fmt.get("format_id"),
+                "url": fmt.get("url"),
+                "ext": fmt.get("ext"),
+                "vcodec": fmt.get("vcodec"),
+                "acodec": fmt.get("acodec"),
+            }
+            for fmt in requested_formats
+        ],
+        "http_headers_used_by_ytdlp": info.get("http_headers"),
+    }
