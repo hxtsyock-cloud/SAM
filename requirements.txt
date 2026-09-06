@@ -7,3 +7,4 @@ curl_cffi
 imageio-ffmpeg
 yt-dlp-ejs
 imageio-ffmpeg
+bgutil-ytdlp-pot-provider
