@@ -132,26 +132,28 @@ def _platform_options(platform: str) -> Dict[str, Any]:
             options["cookiefile"] = cookiefile
 
     if platform == "youtube":
-        # === التعديل الأصلي (كوكيز) — نتركه مؤقتًا كخط رجوع احتياطي ===
-        # لو ما فيه YOUTUBE_COOKIES بالـ environment، cookiefile بترجع None
-        # وما راح تُضاف — يعني ما راح نعتمد عليها إلا لو موجودة فعليًا.
-        cookiefile = _cookiefile(
-            "YOUTUBE_COOKIES",
-            "/etc/secrets/youtube_cookies.txt",
-            "/tmp/youtube_cookies.txt",
-        )
-        if cookiefile:
-            options["cookiefile"] = cookiefile
+        # === تعديل مؤقت: تعطيل كوكيز يوتيوب لهذا الاختبار فقط ===
+        # الكوكيز القديمة منتهية الصلاحية وتسبب تحذيرات تلوّث المحاولة
+        # وتفتح مسار فشل إضافي قبل ما PO Token ياخذ فرصته الحقيقية.
+        # نتركها معطّلة مؤقتًا لحين تأكيد استقرار PO Token عبر عدة اختبارات،
+        # بعدها إما نحذفها نهائيًا أو نعيد تفعيلها كخط رجوع لو احتجنا.
+        #
+        # cookiefile = _cookiefile(
+        #     "YOUTUBE_COOKIES",
+        #     "/etc/secrets/youtube_cookies.txt",
+        #     "/tmp/youtube_cookies.txt",
+        # )
+        # if cookiefile:
+        #     options["cookiefile"] = cookiefile
 
-        # === هذا الجزء موجود أصلًا عندكم — ما تغيّر ===
+        # === تعديل: player_client من ["tv", "web"] إلى ["web"] فقط ===
+        # عميل "tv" يحتاج تسجيل دخول دائمًا بغض النظر عن PO Token —
+        # هذا سلوك معروف بيوتيوب لهذا العميل تحديدًا. عميل "web" هو
+        # المصمم أصلًا للعمل مع PO Token بدون كوكيز.
         options["extractor_args"] = {
-            "youtube": {"player_client": ["tv", "web"]}
+            "youtube": {"player_client": ["web"]}
         }
 
-        # === ✅ التعديل الجديد: ربط yt-dlp بخادم PO Token المحلي ===
-        # هذا يخلي الطلبات تبدو شرعية ليوتيوب بدون الحاجة لكوكيز حساب بشري
-        # للفيديوهات العامة. نضيفه كمفتاح ثاني بنفس قاموس extractor_args
-        # الموجود، بدون ما نمس مفتاح "youtube" الأصلي.
         options["extractor_args"]["youtubepot-bgutilhttp"] = {
             "base_url": [POT_SERVER_BASE_URL]
         }
