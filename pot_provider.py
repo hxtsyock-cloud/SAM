@@ -8,6 +8,7 @@ pot_provider.py
 ضع هذا الملف داخل مجلد المشروع (مثلاً بجانب utils/) واستورده من main.py
 """
 
+import os
 import subprocess
 import time
 import socket
@@ -19,6 +20,11 @@ logger = logging.getLogger("pot_provider")
 POT_SERVER_PORT = 4416
 POT_SERVER_HOST = "127.0.0.1"
 POT_SERVER_BASE_URL = f"http://{POT_SERVER_HOST}:{POT_SERVER_PORT}"
+
+# مسار الملف التنفيذي (binary) اللي يُنزَّل وقت البناء على Render
+# عبر Build Command — راجع render_build_command.txt
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+POT_BINARY_PATH = os.path.join(_PROJECT_ROOT, "bgutil-pot")
 
 _pot_process: subprocess.Popen | None = None
 
@@ -45,19 +51,30 @@ def start_pot_server(max_wait_seconds: int = 15) -> bool:
         logger.info("POT server already running on port %s", POT_SERVER_PORT)
         return True
 
+    if not os.path.isfile(POT_BINARY_PATH):
+        logger.error(
+            "POT server binary not found at %s — did the Render build step "
+            "download it? See render_build_command.txt",
+            POT_BINARY_PATH,
+        )
+        return False
+
+    if not os.access(POT_BINARY_PATH, os.X_OK):
+        try:
+            os.chmod(POT_BINARY_PATH, 0o755)
+        except OSError:
+            logger.exception("Failed to make POT binary executable")
+            return False
+
     try:
-        # الأمر الفعلي يعتمد على طريقة تشغيل النسخة اللي ثبتها من الحزمة.
-        # عدّل هذا السطر حسب الأمر الموثق فعليًا بحزمة bgutil-ytdlp-pot-provider
-        # (تحقق من التوثيق وقت التنفيذ، لأنه قد يختلف بين الإصدارات).
         _pot_process = subprocess.Popen(
             [
-                "python",
-                "-m",
-                "bgutil_ytdlp_pot_provider.server",
-                "--port",
-                str(POT_SERVER_PORT),
+                POT_BINARY_PATH,
+                "server",
                 "--host",
                 POT_SERVER_HOST,
+                "--port",
+                str(POT_SERVER_PORT),
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
