@@ -1,539 +1,579 @@
-import base64
 import os
-import shutil
-from typing import Any, Dict, List, Optional
-from urllib.parse import quote
+import json
+from urllib.parse import unquote
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Tuple
 
-import yt_dlp
-from yt_dlp.networking.impersonate import ImpersonateTarget
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel
+from yt_dlp.utils import DownloadError
 
-from utils.quality import format_selector, normalize_quality
+from platforms import facebook, instagram, snapchat, tiktok, twitter, youtube
+from utils.cache import cache_get, cache_set
+from utils.media import (
+    AUDIO_FORMATS,
+    MEDIA_MODES,
+    download_media,
+    id_to_url,
+    inspect_media,
+    normalize_audio_format,
+    normalize_compression_crf,
+    normalize_limit,
+    normalize_mode,
+    profile_url,
+)
+from utils.quality import normalize_quality, quality_options
+from utils.rate_limit import rate_limit
 
-# === تعديل جديد: استيراد رابط خادم POT المحلي ===
-# لازم يكون ملف pot_provider.py موجود بجذر المشروع (بنفس مستوى main.py)
-from pot_provider import POT_SERVER_BASE_URL
+# === تعديل جديد: استيراد دوال تشغيل/إيقاف خادم PO Token + دالة التشخيص ===
+from pot_provider import start_pot_server, stop_pot_server, get_pot_status
 
-AUDIO_FORMATS = ("mp3", "aac", "m4a", "wav")
-MEDIA_MODES = ("video", "audio", "video_no_audio", "gif")
-MAX_PROFILE_LIMIT = 1000
-MODE_ALIASES = {
-    "audio_only": "audio",
-    "audio-only": "audio",
-    "video_only": "video_no_audio",
-    "video-only": "video_no_audio",
-    "video_without_audio": "video_no_audio",
-    "video-without-audio": "video_no_audio",
-    "no_audio": "video_no_audio",
-    "mute": "video_no_audio",
-    "animated_gif": "gif",
+app = FastAPI(title="Video Downloader Backend")
+
+# === تعديل جديد: تشغيل خادم POT عند إقلاع التطبيق، وإيقافه عند إغلاقه ===
+@app.on_event("startup")
+async def _startup_pot_server():
+    success = start_pot_server()
+    if not success:
+        # التطبيق يستمر يشتغل حتى لو فشل — باقي المنصات ما تعتمد على هذا الخادم،
+        # بس يوتيوب غالبًا بيفشل لين تُحل المشكلة. نسجل تحذير واضح باللوق.
+        print(
+            "WARNING: PO Token server failed to start — YouTube downloads will "
+            "likely fail until this is fixed. Other platforms are unaffected."
+        )
+
+
+@app.on_event("shutdown")
+async def _shutdown_pot_server():
+    stop_pot_server()
+
+
+PLATFORMS = {
+    "tiktok": tiktok,
+    "snapchat": snapchat,
+    "instagram": instagram,
+    "twitter": twitter,
+    "x": twitter,
+    "facebook": facebook,
+    "youtube": youtube,
 }
 
 
-def normalize_limit(limit: int, maximum: int = MAX_PROFILE_LIMIT) -> int:
-    """Validate collection limits instead of treating negative values as unlimited."""
+class SelectedDownloadRequest(BaseModel):
+    video_urls: List[str]
+    quality: str = "best"
+    mode: str = "video"
+    audio_format: str = "m4a"
+    compress: bool = False
+    compression_crf: int = 28
+    no_watermark: bool = False
+    max_concurrency: int = 4
+
+
+def _normalize_download_filename(filename: str) -> str:
+    """Accept a filepath or a serialized API result without exposing paths."""
+    candidate = filename
+    for _ in range(2):
+        candidate = unquote(candidate)
+
     try:
-        value = int(limit)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("limit must be a positive integer") from exc
-    if value < 1:
-        raise ValueError("limit must be at least 1")
-    return min(value, maximum)
+        payload = json.loads(candidate)
+    except (TypeError, ValueError):
+        payload = None
+
+    if isinstance(payload, dict):
+        candidate = payload.get("filepath") or payload.get("filename") or ""
+    elif isinstance(payload, str):
+        candidate = payload
+
+    for _ in range(2):
+        candidate = unquote(str(candidate))
+    candidate = os.path.basename(candidate)
+    if not candidate or candidate in {".", ".."}:
+        raise HTTPException(status_code=400, detail="A valid filename is required")
+    return candidate
 
 
-def normalize_mode(mode: Optional[str]) -> str:
-    value = (mode or "video").strip().lower()
-    value = MODE_ALIASES.get(value, value)
-    if value not in MEDIA_MODES:
-        choices = ", ".join(MEDIA_MODES)
-        raise ValueError(f"Invalid mode. Choose one of: {choices}")
-    return value
+def _canonical_platform(platform: str) -> str:
+    return "twitter" if platform == "x" else platform
 
 
-def normalize_audio_format(audio_format: Optional[str]) -> str:
-    value = (audio_format or "m4a").strip().lower().lstrip(".")
-    if value not in AUDIO_FORMATS:
-        choices = ", ".join(AUDIO_FORMATS)
-        raise ValueError(f"Invalid audio_format. Choose one of: {choices}")
-    return value
+def _find_platform(video_url: str) -> Optional[Tuple[str, object]]:
+    url_lower = video_url.lower()
+    for name, module in PLATFORMS.items():
+        if hasattr(module, "matches_url") and module.matches_url(video_url):
+            return _canonical_platform(name), module
+
+    for name, module in PLATFORMS.items():
+        if name != "x" and name in url_lower:
+            return _canonical_platform(name), module
+    return None
 
 
-def normalize_compression_crf(crf: int) -> int:
-    try:
-        value = int(crf)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("compression_crf must be an integer from 18 to 40") from exc
-    if not 18 <= value <= 40:
-        raise ValueError("compression_crf must be between 18 and 40")
-    return value
+def _platform_or_error(video_url: str) -> str:
+    matched = _find_platform(video_url)
+    if not matched:
+        raise HTTPException(status_code=400, detail="Unsupported platform")
+    return matched[0]
 
 
-def _ffmpeg_location(required: bool = False) -> Optional[str]:
-    location = shutil.which("ffmpeg")
-    if not location:
-        try:
-            import imageio_ffmpeg
-
-            location = imageio_ffmpeg.get_ffmpeg_exe()
-        except (ImportError, RuntimeError):
-            location = None
-    if required and not location:
-        raise RuntimeError(
-            "FFmpeg is required for audio, GIF, and compression features"
-        )
-    return location
-
-
-def _copy_cookie(source: str, destination: str) -> Optional[str]:
-    if not os.path.exists(source):
-        return None
-    shutil.copy(source, destination)
-    return destination
-
-
-def _cookiefile(
-    env_name: str,
-    source: str,
-    destination: str,
-) -> Optional[str]:
-    configured_path = os.getenv(f"{env_name}_PATH")
-    if configured_path and os.path.exists(configured_path):
-        shutil.copy(configured_path, destination)
-        return destination
-
-    encoded = os.getenv(f"{env_name}_B64")
-    if encoded:
-        try:
-            cookie_bytes = base64.b64decode(encoded, validate=True)
-        except (ValueError, TypeError) as exc:
-            raise RuntimeError(f"{env_name}_B64 is not valid base64") from exc
-        with open(destination, "wb") as cookie_file:
-            cookie_file.write(cookie_bytes)
-        return destination
-
-    cookie_text = os.getenv(env_name)
-    if cookie_text:
-        with open(destination, "w", encoding="utf-8", newline="") as cookie_file:
-            cookie_file.write(cookie_text)
-        return destination
-
-    return _copy_cookie(source, destination)
-
-
-def _platform_options(platform: str) -> Dict[str, Any]:
-    options: Dict[str, Any] = {}
-
-    if platform == "facebook":
-        cookiefile = _cookiefile(
-            "FACEBOOK_COOKIES",
-            "/etc/secrets/facebook_cookies.txt",
-            "/tmp/facebook_cookies.txt",
-        )
-        if cookiefile:
-            options["cookiefile"] = cookiefile
-
-    if platform == "youtube":
-        # === التعديل الأصلي (كوكيز) — نتركه مؤقتًا كخط رجوع احتياطي ===
-        # لو ما فيه YOUTUBE_COOKIES بالـ environment، cookiefile بترجع None
-        # وما راح تُضاف — يعني ما راح نعتمد عليها إلا لو موجودة فعليًا.
-        cookiefile = _cookiefile(
-            "YOUTUBE_COOKIES",
-            "/etc/secrets/youtube_cookies.txt",
-            "/tmp/youtube_cookies.txt",
-        )
-        if cookiefile:
-            options["cookiefile"] = cookiefile
-
-        # === هذا الجزء موجود أصلًا عندكم — ما تغيّر ===
-        options["extractor_args"] = {
-            "youtube": {"player_client": ["tv", "web"]}
-        }
-
-        # === ✅ التعديل الجديد: ربط yt-dlp بخادم PO Token المحلي ===
-        # هذا يخلي الطلبات تبدو شرعية ليوتيوب بدون الحاجة لكوكيز حساب بشري
-        # للفيديوهات العامة. نضيفه كمفتاح ثاني بنفس قاموس extractor_args
-        # الموجود، بدون ما نمس مفتاح "youtube" الأصلي.
-        options["extractor_args"]["youtubepot-bgutilhttp"] = {
-            "base_url": [POT_SERVER_BASE_URL]
-        }
-
-        if shutil.which("deno"):
-            options["js_runtimes"] = {"deno": {}}
-        options["remote_components"] = ["ejs:github"]
-
-    if platform == "instagram":
-        cookiefile = _cookiefile(
-            "INSTAGRAM_COOKIES",
-            "/etc/secrets/instagram_cookies.txt",
-            "/tmp/instagram_cookies.txt",
-        )
-        if cookiefile:
-            options["cookiefile"] = cookiefile
-
-    if platform == "tiktok":
-        options.update(
-            {
-                "impersonate": ImpersonateTarget.from_str("chrome"),
-                "retries": 5,
-                "fragment_retries": 5,
-                "http_headers": {"Referer": "https://www.tiktok.com/"},
-            }
-        )
-
-    return options
-
-
-def build_ydl_options(
+def _options(
     platform: str,
-    quality: str = "best",
-    mode: str = "video",
-    audio_format: str = "m4a",
-    compress: bool = False,
-    compression_crf: int = 28,
-    noplaylist: bool = True,
-    extract_flat: bool = False,
-    no_watermark: bool = False,
-    ensure_mp4: bool = True,
-) -> Dict[str, Any]:
-    selected_quality = normalize_quality(quality, platform)
-    selected_mode = normalize_mode(mode)
-    selected_audio_format = normalize_audio_format(audio_format)
-    selected_crf = normalize_compression_crf(compression_crf)
-
-    if compress and selected_mode in ("audio", "gif"):
-        raise ValueError("Compression is available for video modes only")
-
-    requires_ffmpeg = (
-        selected_mode in ("audio", "gif")
-        or compress
-        or (ensure_mp4 and selected_mode in ("video", "video_no_audio"))
-    )
-    ffmpeg_location = _ffmpeg_location(required=requires_ffmpeg)
-    include_audio = selected_mode == "video"
-
-    if selected_mode == "audio":
-        media_format = "bestaudio/best"
-    else:
-        media_format = format_selector(
-            selected_quality,
-            platform,
-            include_audio=include_audio,
-        )
-
-    options: Dict[str, Any] = {
-        "format": media_format,
-        "outtmpl": "%(id).150s.%(ext)s",
-        "noplaylist": noplaylist,
-        "quiet": True,
-    }
-    options.update(_platform_options(platform))
-    if ffmpeg_location:
-        options["ffmpeg_location"] = ffmpeg_location
-    if extract_flat:
-        options["extract_flat"] = True
-
-    if selected_mode == "audio":
-        options["postprocessors"] = [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": selected_audio_format,
-            }
-        ]
-    elif selected_mode == "gif":
-        options["postprocessors"] = [
-            {"key": "FFmpegVideoConvertor", "preferedformat": "gif"}
-        ]
-    elif compress:
-        options["postprocessors"] = [
-            {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}
-        ]
-        options["postprocessor_args"] = {
-            "VideoConvertor": [
-                "-c:v",
-                "libx264",
-                "-crf",
-                str(selected_crf),
-                "-preset",
-                "slow",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
-                "-movflags",
-                "+faststart",
-            ]
-        }
-    elif ensure_mp4 and selected_mode in ("video", "video_no_audio"):
-        # Remuxing copies the encoded streams and therefore preserves their
-        # quality.  It deliberately fails when the source codecs cannot be
-        # placed in an MP4 container instead of silently transcoding them.
-        options["postprocessors"] = [
-            {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}
-        ]
-
-    return options
-
-
-def _entry_summary(entry: Dict[str, Any]) -> Dict[str, Any]:
-    fields = (
-        "id",
-        "title",
-        "description",
-        "url",
-        "webpage_url",
-        "thumbnail",
-        "duration",
-        "upload_date",
-        "timestamp",
-        "view_count",
-        "like_count",
-        "comment_count",
-        "is_live",
-        "live_status",
-        "uploader",
-        "uploader_id",
-        "channel",
-        "channel_id",
-        "repost_count",
-        "is_repost",
-    )
-    return {key: entry.get(key) for key in fields if entry.get(key) is not None}
-
-
-def serialize_info(
-    info: Dict[str, Any],
-    source_url: str,
-    limit: int = 100,
-    maximum: int = MAX_PROFILE_LIMIT,
-) -> Dict[str, Any]:
-    limit = normalize_limit(limit, maximum=maximum)
-    raw_entries = info.get("entries") or []
-    entries = list(raw_entries)
-    total = len(entries)
-    if limit > 0:
-        entries = entries[:limit]
-
-    fields = (
-        "id",
-        "title",
-        "description",
-        "webpage_url",
-        "thumbnail",
-        "duration",
-        "upload_date",
-        "timestamp",
-        "view_count",
-        "like_count",
-        "comment_count",
-        "uploader",
-        "uploader_id",
-        "channel",
-        "channel_id",
-        "channel_url",
-        "categories",
-        "tags",
-        "age_limit",
-        "availability",
-        "is_live",
-        "live_status",
-        "release_timestamp",
-    )
-    result = {
-        "source_url": source_url,
-        "type": info.get("_type", "video"),
-        "entry_count": total,
-        "has_more": limit > 0 and total > len(entries),
-        "entries": [_entry_summary(entry) for entry in entries if entry],
-        "videos": [_entry_summary(entry) for entry in entries if entry],
-        "profile": {
-            "username": info.get("uploader") or info.get("uploader_id"),
-            "display_name": info.get("uploader") or info.get("channel"),
-            "avatar_url": (
-                info.get("uploader_avatar")
-                or info.get("channel_thumbnail")
-                or info.get("thumbnail")
-            ),
-            "bio": info.get("uploader_description") or info.get("description"),
-            "url": info.get("uploader_url") or info.get("channel_url"),
-        },
-        "reposts": info.get("reposts") or info.get("reposted_entries") or [],
-        "reposts_available": bool(
-            info.get("reposts") or info.get("reposted_entries")
-        ),
-    }
-    result.update({key: info.get(key) for key in fields if info.get(key) is not None})
-    return result
-
-
-def inspect_media(
-    source_url: str,
-    platform: str,
-    limit: int = 100,
-    source_kind: str = "video",
-    maximum: int = MAX_PROFILE_LIMIT,
-) -> Dict[str, Any]:
-    options = build_ydl_options(
-        platform,
-        mode="video",
-        noplaylist=False,
-        extract_flat=True,
-        ensure_mp4=False,
-    )
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(source_url, download=False)
-    result = serialize_info(info, source_url, limit=limit, maximum=maximum)
-    result["source_kind"] = source_kind
-    return result
-
-
-def _watermark_is_proven_absent(info: Dict[str, Any]) -> bool:
-    """Only accept an explicit extractor guarantee for no-watermark mode."""
-    if info.get("watermark_free") is True or info.get("is_watermark_free") is True:
-        return True
-    if info.get("has_watermark") is False or info.get("watermark") is False:
-        return True
-    for fmt in info.get("formats") or []:
-        if fmt.get("watermark_free") is True or fmt.get("is_watermark_free") is True:
-            return True
-    return False
-
-
-def _final_filepath(
-    filename: str,
+    quality: str,
     mode: str,
     audio_format: str,
     compress: bool,
-) -> str:
-    root, _ = os.path.splitext(filename)
-    if mode == "audio":
-        return f"{root}.{audio_format}"
-    if mode == "gif":
-        return f"{root}.gif"
-    if mode in ("video", "video_no_audio") or compress:
-        return f"{root}.mp4"
-    return filename
+    compression_crf: int,
+    no_watermark: bool = False,
+) -> Dict[str, Any]:
+    try:
+        return {
+            "quality": normalize_quality(quality, platform),
+            "mode": normalize_mode(mode),
+            "audio_format": normalize_audio_format(audio_format),
+            "compress": bool(compress),
+            "compression_crf": normalize_compression_crf(compression_crf),
+            "no_watermark": bool(no_watermark),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-def download_media(
+def _media_error(exc: Exception) -> None:
+    message = str(exc).strip()
+    lowered = message.lower()
+    if message.startswith("Selection required"):
+        raise HTTPException(status_code=409, detail=message) from exc
+    if isinstance(exc, DownloadError):
+        requires_auth = any(
+            phrase in lowered
+            for phrase in (
+                "sign in",
+                "log in",
+                "login",
+                "not a bot",
+                "cookies",
+                "authentication",
+                "confirm you're not a bot",
+            )
+        )
+        if requires_auth:
+            message = (
+                "The platform requires authentication cookies. Configure the "
+                "matching platform cookie secret, for example "
+                "INSTAGRAM_COOKIES_B64 or YOUTUBE_COOKIES_B64 using a Netscape "
+                "cookies file, then retry."
+            )
+        raise HTTPException(
+            status_code=502,
+            detail={"code": "upstream_extractor_error", "message": message[:500]},
+        ) from exc
+    if isinstance(exc, RuntimeError):
+        raise HTTPException(status_code=503, detail=message) from exc
+    raise HTTPException(status_code=400, detail=message) from exc
+
+
+def _capabilities() -> Dict[str, Any]:
+    return {
+        "platforms": list(PLATFORMS.keys()),
+        "qualities": {
+            platform: quality_options(_canonical_platform(platform))
+            for platform in PLATFORMS
+        },
+        "modes": list(MEDIA_MODES),
+        "audio_formats": list(AUDIO_FORMATS),
+        "features": {
+            "profile_inspection": True,
+            "playlist_selection_before_download": True,
+            "story_inspection": True,
+            "finished_live_download": True,
+            "gif_conversion": True,
+            "video_compression": True,
+            "download_all_profile_videos": True,
+            "watermark_removal": False,
+            "watermark_free_strict_mode": True,
+            "watermark_policy": (
+                "no_watermark=true returns only an explicitly verified "
+                "watermark-free source; otherwise it fails safely"
+            ),
+            "parallel_batch_download": True,
+        },
+        "frontend_inputs": ["video_or_story_url", "username"],
+    }
+
+
+def _inspect_source(
     source_url: str,
+    limit: int = 100,
+    source_kind: str = "video",
+) -> Dict[str, Any]:
+    platform = _platform_or_error(source_url)
+    try:
+        return inspect_media(
+            source_url,
+            platform,
+            limit=normalize_limit(limit),
+            source_kind=source_kind,
+        )
+    except (ValueError, RuntimeError, DownloadError) as exc:
+        _media_error(exc)
+    raise AssertionError("unreachable")
+
+
+def _download_one(
+    request: Request,
+    source_url: str,
+    quality: str,
+    mode: str,
+    audio_format: str,
+    compress: bool,
+    compression_crf: int,
+    no_watermark: bool = False,
+) -> Dict[str, Any]:
+    rate_limit(request)
+    platform = _platform_or_error(source_url)
+    options = _options(
+        platform,
+        quality,
+        mode,
+        audio_format,
+        compress,
+        compression_crf,
+        no_watermark,
+    )
+    cache_key = "|".join(
+        [
+            source_url,
+            options["quality"],
+            options["mode"],
+            options["audio_format"],
+            str(options["compress"]),
+            str(options["compression_crf"]),
+            str(options["no_watermark"]),
+        ]
+    )
+    if options["mode"] == "video" and not options["compress"]:
+        cached = cache_get(cache_key)
+        if cached:
+            return cached
+
+    try:
+        result = download_media(source_url, platform, **options)
+    except (ValueError, RuntimeError, DownloadError) as exc:
+        _media_error(exc)
+    if options["mode"] == "video" and not options["compress"]:
+        cache_set(cache_key, result)
+    return result
+
+
+def _entry_urls(profile: Dict[str, Any]) -> List[str]:
+    urls = []
+    for entry in profile.get("entries", []):
+        url = entry.get("webpage_url") or entry.get("url")
+        if url:
+            urls.append(url)
+    return urls
+
+
+def _download_many(
+    request: Request,
+    video_urls: List[str],
+    quality: str,
+    mode: str,
+    audio_format: str,
+    compress: bool,
+    compression_crf: int,
+    no_watermark: bool = False,
+    max_concurrency: int = 4,
+) -> Dict[str, Any]:
+    if not video_urls:
+        raise HTTPException(status_code=400, detail="video_urls cannot be empty")
+
+    try:
+        workers = max(1, min(int(max_concurrency), 8))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="max_concurrency must be an integer from 1 to 8",
+        ) from exc
+
+    videos_by_index: Dict[int, Dict[str, Any]] = {}
+    errors_by_index: Dict[int, Dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                _download_one,
+                request,
+                source_url,
+                quality,
+                mode,
+                audio_format,
+                compress,
+                compression_crf,
+                no_watermark,
+            ): (index, source_url)
+            for index, source_url in enumerate(video_urls)
+        }
+        for future in as_completed(futures):
+            index, source_url = futures[future]
+            try:
+                videos_by_index[index] = future.result()
+            except HTTPException as exc:
+                errors_by_index[index] = {"url": source_url, "error": exc.detail}
+            except Exception as exc:
+                errors_by_index[index] = {
+                    "url": source_url,
+                    "error": {"code": "unexpected_download_error", "message": str(exc)},
+                }
+
+    videos = [videos_by_index[index] for index in sorted(videos_by_index)]
+    errors = [errors_by_index[index] for index in sorted(errors_by_index)]
+    return {
+        "requested": len(video_urls),
+        "downloaded": len(videos),
+        "videos": videos,
+        "errors": errors,
+    }
+
+
+@app.get("/platforms")
+async def get_platforms():
+    return _capabilities()
+
+
+@app.get("/")
+async def health():
+    return {
+        "service": app.title,
+        "status": "ok",
+        "health": "/",
+        "documentation": "/docs",
+        "capabilities": "/capabilities",
+    }
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    return Response(status_code=204)
+
+
+@app.get("/capabilities")
+async def get_capabilities():
+    return _capabilities()
+
+
+# === تعديل جديد: Endpoint تشخيصي مؤقت لفحص حالة خادم POT من داخل نفس العملية ===
+@app.get("/debug/pot-status")
+async def debug_pot_status():
+    return get_pot_status()
+
+
+# === تعديل جديد: Endpoint تشخيصي لالتقاط سجل yt-dlp الكامل عند فحص فيديو يوتيوب ===
+@app.get("/debug/youtube-probe")
+async def debug_youtube_probe_endpoint(video_url: str):
+    from utils.media import debug_youtube_probe
+    return debug_youtube_probe(video_url)
+
+
+@app.get("/inspect/by-url")
+async def inspect_by_url(video_url: str, limit: int = 100):
+    return _inspect_source(video_url, limit)
+
+
+@app.get("/inspect/playlist")
+async def inspect_playlist(playlist_url: str, limit: int = 100):
+    return _inspect_source(playlist_url, limit, source_kind="playlist")
+
+
+@app.get("/inspect/story")
+async def inspect_story(story_url: str, limit: int = 100):
+    return _inspect_source(story_url, limit, source_kind="story")
+
+
+@app.post("/inspect/by-username")
+async def inspect_by_username(
+    request: Request,
     platform: str,
+    username: str,
+    limit: int = 100,
+):
+    rate_limit(request)
+    platform = _canonical_platform(platform.lower())
+    if platform not in PLATFORMS or platform == "x":
+        raise HTTPException(status_code=400, detail="Unsupported platform")
+    try:
+        source_url = profile_url(platform, username)
+        result = inspect_media(
+            source_url,
+            platform,
+            limit=normalize_limit(limit),
+            source_kind="profile",
+            maximum=1000,
+        )
+        result["profile_url"] = source_url
+        result["username"] = username.lstrip("@")
+        return result
+    except (ValueError, RuntimeError, DownloadError) as exc:
+        _media_error(exc)
+
+
+@app.post("/download/by-url")
+async def download_by_url(
+    request: Request,
+    video_url: str,
     quality: str = "best",
     mode: str = "video",
     audio_format: str = "m4a",
     compress: bool = False,
     compression_crf: int = 28,
     no_watermark: bool = False,
-) -> Dict[str, Any]:
-    selected_mode = normalize_mode(mode)
-    selected_audio_format = normalize_audio_format(audio_format)
-    selected_crf = normalize_compression_crf(compression_crf)
-    selected_quality = normalize_quality(quality, platform)
-
-    probe_options = build_ydl_options(
-        platform,
-        quality=selected_quality,
-        mode=selected_mode,
-        audio_format=selected_audio_format,
-        compress=compress,
-        compression_crf=selected_crf,
-        noplaylist=False,
-        no_watermark=no_watermark,
-    )
-    with yt_dlp.YoutubeDL(probe_options) as ydl:
-        info = ydl.extract_info(source_url, download=False)
-
-    entries = list(info.get("entries") or [])
-    if info.get("_type") in ("playlist", "multi_video") or len(entries) > 1:
-        raise ValueError(
-            "Selection required: inspect the source first and send selected video URLs"
-        )
-
-    live_status = info.get("live_status")
-    if live_status == "is_live" or (
-        info.get("is_live") is True
-        and live_status not in {"was_live", "post_live", "not_live"}
-    ):
-        raise ValueError("The live stream is still in progress")
-    if no_watermark and not _watermark_is_proven_absent(info):
-        raise RuntimeError(
-            "No watermark-free source was verified; refusing to return a "
-            "possibly watermarked file"
-        )
-
-    download_options = build_ydl_options(
-        platform,
-        quality=selected_quality,
-        mode=selected_mode,
-        audio_format=selected_audio_format,
-        compress=compress,
-        compression_crf=selected_crf,
-        noplaylist=True,
-        no_watermark=no_watermark,
-    )
-    with yt_dlp.YoutubeDL(download_options) as ydl:
-        # نستخدم extract_info(download=True) بدل download() + info القديمة،
-        # عشان نضمن إن اسم الملف محسوب من نفس عملية التحميل الفعلية
-        # (بعض الروابط، زي مشاركات سناب شات، تحتوي رموز جلسة تتغيّر
-        # بين كل زيارة، فلو استخدمنا معلومات من زيارة فحص سابقة،
-        # يصير تعارض بين الاسم المتوقع والاسم الفعلي المحفوظ)
-        download_info = ydl.extract_info(source_url, download=True)
-        filename = ydl.prepare_filename(download_info)
-        info = download_info
-
-    filepath = _final_filepath(
-        filename,
-        selected_mode,
-        selected_audio_format,
+):
+    return _download_one(
+        request,
+        video_url,
+        quality,
+        mode,
+        audio_format,
         compress,
+        compression_crf,
+        no_watermark,
     )
-    if selected_mode in ("video", "video_no_audio") and not filepath.lower().endswith(
-        ".mp4"
-    ):
-        raise RuntimeError("The downloaded video was not produced as an MP4 file")
-    if not os.path.isfile(filepath):
-        raise RuntimeError(f"Download completed but output file is missing: {filepath}")
-
-    return {
-        "platform": platform,
-        "video_id": info.get("id"),
-        "title": info.get("title"),
-        "webpage_url": info.get("webpage_url") or source_url,
-        "quality": selected_quality,
-        "mode": selected_mode,
-        "audio_format": selected_audio_format if selected_mode == "audio" else None,
-        "compressed": bool(compress),
-        "container": "mp4" if selected_mode in ("video", "video_no_audio") else None,
-        "filepath": filepath,
-    }
 
 
-def profile_url(platform: str, username: str) -> str:
-    value = username.strip().lstrip("@")
-    if value.startswith("http://") or value.startswith("https://"):
-        return value
-    encoded = quote(value, safe="._-")
-    templates = {
-        "youtube": f"https://www.youtube.com/@{encoded}",
-        "tiktok": f"https://www.tiktok.com/@{encoded}",
-        "instagram": f"https://www.instagram.com/{encoded}/",
-        "twitter": f"https://x.com/{encoded}",
-        "facebook": f"https://www.facebook.com/{encoded}",
-        "snapchat": f"https://www.snapchat.com/add/{encoded}",
-    }
-    if platform not in templates:
-        raise ValueError(f"Username lookup is not configured for {platform}")
-    return templates[platform]
+@app.post("/download/live")
+async def download_finished_live(
+    request: Request,
+    video_url: str,
+    quality: str = "best",
+    mode: str = "video",
+    audio_format: str = "m4a",
+    compress: bool = False,
+    compression_crf: int = 28,
+    no_watermark: bool = False,
+):
+    return _download_one(
+        request,
+        video_url,
+        quality,
+        mode,
+        audio_format,
+        compress,
+        compression_crf,
+        no_watermark,
+    )
 
 
-def id_to_url(platform: str, video_id: str) -> str:
-    encoded = quote(str(video_id), safe="._-")
-    templates = {
-        "youtube": f"https://youtube.com/watch?v={encoded}",
-        "tiktok": f"https://www.tiktok.com/@_/video/{encoded}",
-        "twitter": f"https://twitter.com/i/status/{encoded}",
-    }
-    if platform not in templates:
-        raise ValueError(
-            "ID downloads are supported for youtube, tiktok, and twitter; "
-            "use selected video URLs for other platforms"
+@app.post("/download/selected")
+async def download_selected(request: Request, payload: SelectedDownloadRequest):
+    return _download_many(
+        request,
+        payload.video_urls,
+        payload.quality,
+        payload.mode,
+        payload.audio_format,
+        payload.compress,
+        payload.compression_crf,
+        payload.no_watermark,
+        payload.max_concurrency,
+    )
+
+
+@app.post("/download/by-username")
+async def download_by_username(
+    request: Request,
+    platform: str,
+    username: str,
+    quality: str = "best",
+    mode: str = "video",
+    audio_format: str = "m4a",
+    compress: bool = False,
+    compression_crf: int = 28,
+    download_all: bool = False,
+    limit: int = 1000,
+    no_watermark: bool = False,
+    max_concurrency: int = 4,
+):
+    rate_limit(request)
+    canonical = _canonical_platform(platform.lower())
+    if canonical not in PLATFORMS:
+        raise HTTPException(status_code=400, detail="Unsupported platform")
+
+    try:
+        source_url = profile_url(canonical, username)
+        profile = inspect_media(
+            source_url,
+            canonical,
+            limit=normalize_limit(limit, maximum=10000),
+            source_kind="profile",
+            maximum=10000,
         )
-    return templates[platform]
+        profile["profile_url"] = source_url
+        profile["username"] = username.lstrip("@")
+    except (ValueError, RuntimeError, DownloadError) as exc:
+        _media_error(exc)
+
+    if not download_all:
+        profile["selection_required"] = True
+        return profile
+
+    urls = _entry_urls(profile)
+    return _download_many(
+        request,
+        urls,
+        quality,
+        mode,
+        audio_format,
+        compress,
+        compression_crf,
+        no_watermark,
+        max_concurrency,
+    )
+
+
+@app.post("/download/by-ids")
+async def download_by_ids(
+    request: Request,
+    platform: str,
+    video_ids: List[str],
+    quality: str = "best",
+    mode: str = "video",
+    audio_format: str = "m4a",
+    compress: bool = False,
+    compression_crf: int = 28,
+    no_watermark: bool = False,
+    max_concurrency: int = 4,
+):
+    canonical = _canonical_platform(platform.lower())
+    if canonical not in PLATFORMS:
+        raise HTTPException(status_code=400, detail="Unsupported platform")
+    try:
+        urls = [id_to_url(canonical, video_id) for video_id in video_ids]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _download_many(
+        request,
+        urls,
+        quality,
+        mode,
+        audio_format,
+        compress,
+        compression_crf,
+        no_watermark,
+        max_concurrency,
+    )
+
+
+@app.get("/download/file")
+async def download_file(filename: str):
+    safe_filename = _normalize_download_filename(filename)
+    file_path = os.path.join(os.getcwd(), safe_filename)
+
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return FileResponse(
+        path=file_path,
+        filename=safe_filename,
+        media_type="application/octet-stream",
+    )
