@@ -9,6 +9,10 @@ from yt_dlp.networking.impersonate import ImpersonateTarget
 
 from utils.quality import format_selector, normalize_quality
 
+# === تعديل جديد: استيراد رابط خادم POT المحلي ===
+# لازم يكون ملف pot_provider.py موجود بجذر المشروع (بنفس مستوى main.py)
+from pot_provider import POT_SERVER_BASE_URL
+
 AUDIO_FORMATS = ("mp3", "aac", "m4a", "wav")
 MEDIA_MODES = ("video", "audio", "video_no_audio", "gif")
 MAX_PROFILE_LIMIT = 1000
@@ -128,6 +132,9 @@ def _platform_options(platform: str) -> Dict[str, Any]:
             options["cookiefile"] = cookiefile
 
     if platform == "youtube":
+        # === التعديل الأصلي (كوكيز) — نتركه مؤقتًا كخط رجوع احتياطي ===
+        # لو ما فيه YOUTUBE_COOKIES بالـ environment، cookiefile بترجع None
+        # وما راح تُضاف — يعني ما راح نعتمد عليها إلا لو موجودة فعليًا.
         cookiefile = _cookiefile(
             "YOUTUBE_COOKIES",
             "/etc/secrets/youtube_cookies.txt",
@@ -135,9 +142,20 @@ def _platform_options(platform: str) -> Dict[str, Any]:
         )
         if cookiefile:
             options["cookiefile"] = cookiefile
+
+        # === هذا الجزء موجود أصلًا عندكم — ما تغيّر ===
         options["extractor_args"] = {
             "youtube": {"player_client": ["tv", "web"]}
         }
+
+        # === ✅ التعديل الجديد: ربط yt-dlp بخادم PO Token المحلي ===
+        # هذا يخلي الطلبات تبدو شرعية ليوتيوب بدون الحاجة لكوكيز حساب بشري
+        # للفيديوهات العامة. نضيفه كمفتاح ثاني بنفس قاموس extractor_args
+        # الموجود، بدون ما نمس مفتاح "youtube" الأصلي.
+        options["extractor_args"]["youtubepot-bgutilhttp"] = {
+            "base_url": [POT_SERVER_BASE_URL]
+        }
+
         if shutil.which("deno"):
             options["js_runtimes"] = {"deno": {}}
         options["remote_components"] = ["ejs:github"]
