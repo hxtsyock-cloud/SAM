@@ -26,8 +26,8 @@ from utils.media import (
 from utils.quality import normalize_quality, quality_options
 from utils.rate_limit import rate_limit
 
-# === تعديل جديد: استيراد دوال تشغيل/إيقاف خادم PO Token ===
-from pot_provider import start_pot_server, stop_pot_server
+# === تعديل جديد: استيراد دوال تشغيل/إيقاف خادم PO Token + دالة التشخيص ===
+from pot_provider import start_pot_server, stop_pot_server, get_pot_status
 
 app = FastAPI(title="Video Downloader Backend")
 
@@ -361,6 +361,12 @@ async def favicon():
 @app.get("/capabilities")
 async def get_capabilities():
     return _capabilities()
+
+
+# === تعديل جديد: Endpoint تشخيصي مؤقت لفحص حالة خادم POT من داخل نفس العملية ===
+@app.get("/debug/pot-status")
+async def debug_pot_status():
+    return get_pot_status()
 
 
 @app.get("/inspect/by-url")
