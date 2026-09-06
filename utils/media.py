@@ -158,7 +158,7 @@ def _platform_options(platform: str) -> Dict[str, Any]:
         options["extractor_args"] = {
             "youtube": {
                 "player_client": ["mweb"],
-                "player_skip": ["webpage", "configs"],
+                
             }
         }
 
