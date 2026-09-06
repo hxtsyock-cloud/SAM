@@ -151,7 +151,7 @@ def _platform_options(platform: str) -> Dict[str, Any]:
         # هذا سلوك معروف بيوتيوب لهذا العميل تحديدًا. عميل "web" هو
         # المصمم أصلًا للعمل مع PO Token بدون كوكيز.
         options["extractor_args"] = {
-            "youtube": {"player_client": ["web"]}
+            "youtube": {"player_client": ["mweb"]}
         }
 
         options["extractor_args"]["youtubepot-bgutilhttp"] = {
