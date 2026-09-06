@@ -26,7 +26,28 @@ from utils.media import (
 from utils.quality import normalize_quality, quality_options
 from utils.rate_limit import rate_limit
 
+# === تعديل جديد: استيراد دوال تشغيل/إيقاف خادم PO Token ===
+from pot_provider import start_pot_server, stop_pot_server
+
 app = FastAPI(title="Video Downloader Backend")
+
+# === تعديل جديد: تشغيل خادم POT عند إقلاع التطبيق، وإيقافه عند إغلاقه ===
+@app.on_event("startup")
+async def _startup_pot_server():
+    success = start_pot_server()
+    if not success:
+        # التطبيق يستمر يشتغل حتى لو فشل — باقي المنصات ما تعتمد على هذا الخادم،
+        # بس يوتيوب غالبًا بيفشل لين تُحل المشكلة. نسجل تحذير واضح باللوق.
+        print(
+            "WARNING: PO Token server failed to start — YouTube downloads will "
+            "likely fail until this is fixed. Other platforms are unaffected."
+        )
+
+
+@app.on_event("shutdown")
+async def _shutdown_pot_server():
+    stop_pot_server()
+
 
 PLATFORMS = {
     "tiktok": tiktok,
