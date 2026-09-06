@@ -146,19 +146,14 @@ def _platform_options(platform: str) -> Dict[str, Any]:
         # if cookiefile:
         #     options["cookiefile"] = cookiefile
 
-        # === تعديل: player_client إلى ["mweb"] + player_skip جديد ===
+        # === تعديل: player_client إلى ["mweb"] فقط ===
         # عميل "mweb" يعمل بشكل أفضل مع PO Token (bgutil) من "tv"/"web".
-        # === ✅ تعديل جديد: player_skip يتخطى خطوة "تحميل صفحة الفيديو"
-        # (webpage) وملفات الإعدادات (configs) — هذي الخطوة بالذات هي
-        # اللي تتعثر أحيانًا بخطأ 429 (Too Many Requests) من يوتيوب،
-        # وفشلها يمنع الحصول على بيانات جلسة سليمة، فيفشل PO Token
-        # بشكل غير مباشر حتى لو الخادم نفسه شغّال تمام. تخطي هذي
-        # الخطوة يخلي yt-dlp يعتمد مباشرة على طلب الـ API + PO Token
-        # بدل المرور بخطوة إضافية عرضة للحظر المؤقت.
+        # لا نستخدم player_skip هنا — خطوة تحميل الصفحة ضرورية لتوفير
+        # "Visitor Data" اللي يحتاجها GVS PO Token، وتخطيها كان يسبب
+        # فشل المصادقة بالكامل (جُرّب وتأكد بهذه الجلسة).
         options["extractor_args"] = {
             "youtube": {
                 "player_client": ["mweb"],
-                
             }
         }
 
@@ -166,11 +161,7 @@ def _platform_options(platform: str) -> Dict[str, Any]:
             "base_url": [POT_SERVER_BASE_URL]
         }
 
-        # === ✅ تعديل جديد: إعادة محاولة تلقائية عند أخطاء مؤقتة (زي 429) ===
-        # لو أي طلب HTTP فرعي (غير خطوة الصفحة اللي تخطيناها) رجع خطأ
-        # مؤقت، yt-dlp يعيد المحاولة بدل الفشل الفوري. هذا لا يضمن
-        # الحل 100%، لكنه يرفع فرصة النجاح لأن المشكلة أثبتت أنها
-        # متقطعة (أحيانًا تنجح وأحيانًا لأ) وليست حظر دائم.
+        # === إعادة محاولة تلقائية عند أخطاء مؤقتة (زي 429) ===
         options["retries"] = 5
         options["extractor_retries"] = 3
         options["fragment_retries"] = 5
@@ -247,6 +238,16 @@ def build_ydl_options(
         "noplaylist": noplaylist,
         "quiet": True,
     }
+
+    # === تعديل جديد: ليوتيوب بس، جرّب صيغة مدمجة (غالبًا HLS) أول ===
+    # حسب توثيق yt-dlp الرسمي، صيغ HLS (m3u8) لعميل mweb لا تحتاج
+    # GVS PO Token، بعكس صيغ HTTPS المنفصلة (فيديو+صوت) اللي نطلبها
+    # حاليًا بالتركيبة "bestvideo+bestaudio". نجرب "best" (صيغة مدمجة
+    # جاهزة، غالبًا HLS) أول، ولو ما توفرت نرجع للتركيبة القديمة.
+    if platform == "youtube" and selected_mode in ("video", "video_no_audio"):
+        media_format = f"best/{media_format}"
+
+    options["format"] = media_format
     options.update(_platform_options(platform))
     if ffmpeg_location:
         options["ffmpeg_location"] = ffmpeg_location
