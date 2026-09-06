@@ -146,16 +146,36 @@ def _platform_options(platform: str) -> Dict[str, Any]:
         # if cookiefile:
         #     options["cookiefile"] = cookiefile
 
-        # === تعديل: player_client من ["tv", "web"] إلى ["web"] فقط ===
-        # عميل "tv" يحتاج تسجيل دخول دائمًا بغض النظر عن PO Token —
-        # هذا سلوك معروف بيوتيوب لهذا العميل تحديدًا. عميل "web" هو
-        # المصمم أصلًا للعمل مع PO Token بدون كوكيز.
+        # === تعديل: player_client إلى ["mweb"] + player_skip جديد ===
+        # عميل "mweb" يعمل بشكل أفضل مع PO Token (bgutil) من "tv"/"web".
+        # === ✅ تعديل جديد: player_skip يتخطى خطوة "تحميل صفحة الفيديو"
+        # (webpage) وملفات الإعدادات (configs) — هذي الخطوة بالذات هي
+        # اللي تتعثر أحيانًا بخطأ 429 (Too Many Requests) من يوتيوب،
+        # وفشلها يمنع الحصول على بيانات جلسة سليمة، فيفشل PO Token
+        # بشكل غير مباشر حتى لو الخادم نفسه شغّال تمام. تخطي هذي
+        # الخطوة يخلي yt-dlp يعتمد مباشرة على طلب الـ API + PO Token
+        # بدل المرور بخطوة إضافية عرضة للحظر المؤقت.
         options["extractor_args"] = {
-            "youtube": {"player_client": ["mweb"]}
+            "youtube": {
+                "player_client": ["mweb"],
+                "player_skip": ["webpage", "configs"],
+            }
         }
 
         options["extractor_args"]["youtubepot-bgutilhttp"] = {
             "base_url": [POT_SERVER_BASE_URL]
+        }
+
+        # === ✅ تعديل جديد: إعادة محاولة تلقائية عند أخطاء مؤقتة (زي 429) ===
+        # لو أي طلب HTTP فرعي (غير خطوة الصفحة اللي تخطيناها) رجع خطأ
+        # مؤقت، yt-dlp يعيد المحاولة بدل الفشل الفوري. هذا لا يضمن
+        # الحل 100%، لكنه يرفع فرصة النجاح لأن المشكلة أثبتت أنها
+        # متقطعة (أحيانًا تنجح وأحيانًا لأ) وليست حظر دائم.
+        options["retries"] = 5
+        options["extractor_retries"] = 3
+        options["fragment_retries"] = 5
+        options["retry_sleep_functions"] = {
+            "http": lambda n: min(4, 1 + n),
         }
 
         if shutil.which("deno"):
