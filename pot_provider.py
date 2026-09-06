@@ -4,10 +4,8 @@ pot_provider.py
 موديول يدير تشغيل/إيقاف خادم PO Token (bgutil-ytdlp-pot-provider)
 كـ subprocess داخلي على منفذ محلي، عشان yt-dlp يقدر يستخدمه
 لتحميل فيديوهات يوتيوب العامة بدون كوكيز حساب بشري.
-
 ضع هذا الملف داخل مجلد المشروع (مثلاً بجانب utils/) واستورده من main.py
 """
-
 import os
 import subprocess
 import time
@@ -42,11 +40,9 @@ def start_pot_server(max_wait_seconds: int = 15) -> bool:
     """
     يشغّل خادم POT كـ subprocess ويتأكد إنه صار جاهز قبل الرجوع.
     يُستدعى مرة وحدة عند إقلاع FastAPI (startup_event).
-
     يرجع True لو نجح التشغيل والتأكد من الجاهزية، False غير ذلك.
     """
     global _pot_process
-
     if _is_port_open(POT_SERVER_HOST, POT_SERVER_PORT):
         logger.info("POT server already running on port %s", POT_SERVER_PORT)
         return True
@@ -108,6 +104,70 @@ def stop_pot_server() -> None:
         except subprocess.TimeoutExpired:
             _pot_process.kill()
     _pot_process = None
+
+
+# === تعديل جديد: دالة تشخيص شاملة تُستدعى من Endpoint مؤقت ===
+def get_pot_status() -> dict:
+    """
+    يفحص الحالة الحقيقية لخادم POT والعميل، ويرجع تقرير JSON كامل.
+    يُستخدم فقط للتشخيص المؤقت عبر /debug/pot-status، لا يُغيّر أي سلوك تشغيلي.
+    """
+    status: dict = {}
+
+    # 1) هل الملف موجود وقابل للتنفيذ؟
+    status["binary_exists"] = os.path.isfile(POT_BINARY_PATH)
+    status["binary_executable"] = (
+        os.access(POT_BINARY_PATH, os.X_OK) if status["binary_exists"] else False
+    )
+
+    # 2) هل المنفذ المحلي مفتوح فعليًا الآن؟
+    status["port_open"] = _is_port_open(POT_SERVER_HOST, POT_SERVER_PORT)
+
+    # 3) هل الـ subprocess نفسه لسا حي (لو شُغّل بهذي العملية بالذات)؟
+    if _pot_process is not None:
+        status["process_tracked"] = True
+        status["process_alive"] = _pot_process.poll() is None
+    else:
+        status["process_tracked"] = False
+        status["process_alive"] = None
+
+    # 4) هل نقدر نتواصل فعليًا مع الخادم عبر HTTP؟
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen(POT_SERVER_BASE_URL, timeout=2) as resp:
+            status["http_reachable"] = True
+            status["http_status_code"] = resp.status
+    except Exception as e:
+        status["http_reachable"] = False
+        status["http_error"] = f"{type(e).__name__}: {e}"
+
+    # 5) هل حزمة العميل (bgutil-ytdlp-pot-provider) مثبّتة فعليًا؟
+    try:
+        import importlib.metadata as _md
+
+        status["client_package_version"] = _md.version(
+            "bgutil-ytdlp-pot-provider"
+        )
+    except Exception as e:
+        status["client_package_version"] = None
+        status["client_package_error"] = f"{type(e).__name__}: {e}"
+
+    # 6) هل yt-dlp نفسه يشوف الـ plugin مسجّل ضمن الـ extractors المتاحة؟
+    try:
+        import yt_dlp.extractor as _ext
+
+        plugin_names = [
+            name
+            for name in dir(_ext)
+            if "bgutil" in name.lower() or "pot" in name.lower()
+        ]
+        status["ytdlp_pot_related_extractors"] = plugin_names
+    except Exception as e:
+        status["ytdlp_pot_related_extractors"] = None
+        status["ytdlp_check_error"] = f"{type(e).__name__}: {e}"
+
+    return status
 
 
 # يضمن إيقاف الخادم حتى لو التطبيق انتهى بشكل غير متوقع
