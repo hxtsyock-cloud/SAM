@@ -376,6 +376,13 @@ async def debug_youtube_probe_endpoint(video_url: str):
     return debug_youtube_probe(video_url)
 
 
+# === تعديل جديد: Endpoint تشخيصي يرجّع الرابط المباشر بدون تحميل على السيرفر ===
+@app.get("/debug/youtube-direct-link")
+async def debug_youtube_direct_link_endpoint(video_url: str):
+    from utils.media import debug_youtube_direct_link
+    return debug_youtube_direct_link(video_url)
+
+
 @app.get("/inspect/by-url")
 async def inspect_by_url(video_url: str, limit: int = 100):
     return _inspect_source(video_url, limit)
